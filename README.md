@@ -30,7 +30,7 @@ This tool is for **AUTHORIZED SECURITY TESTING ONLY**. You must have explicit wr
 ### Dependencies
 
 ```bash
-# Ubuntu/Debian
+# Ubuntu/Debian / Kali Linux
 sudo apt-get install libnghttp2-dev libssl-dev build-essential
 
 # Fedora/RHEL
@@ -38,3 +38,6 @@ sudo dnf install libnghttp2-devel openssl-devel gcc make
 
 # Arch Linux
 sudo pacman -S nghttp2 openssl gcc make
+
+# Termux (Android)
+pkg update && pkg install libnghttp2 openssl clang make
