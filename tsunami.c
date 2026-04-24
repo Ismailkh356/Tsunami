@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <inttypes.h>
 
 // HTTP/2 libraries
 #include <nghttp2/nghttp2.h>
@@ -79,18 +80,67 @@ typedef struct {
 // ============== HTTP/2 Callbacks ==============
 static ssize_t h2_send_callback(nghttp2_session *session, const uint8_t *data, size_t len, int flags, void *user_data) {
     H2Session *h2 = (H2Session*)user_data;
-    ssize_t sent = send(h2->sockfd, data, len, 0);
-    
-    if (sent > 0) {
-        h2->bytes_sent += sent;
-        __sync_fetch_and_add(&h2->config->total_bytes_sent, sent);
+    ssize_t sent;
+
+    (void)session; (void)flags;
+
+    if (h2->ssl) {
+        sent = SSL_write(h2->ssl, data, (int)len);
+        if (sent <= 0) {
+            int err = SSL_get_error(h2->ssl, (int)sent);
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ)
+                return NGHTTP2_ERR_WOULDBLOCK;
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    } else {
+        sent = send(h2->sockfd, data, len, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return NGHTTP2_ERR_WOULDBLOCK;
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
     }
-    
+
+    if (sent > 0) {
+        h2->bytes_sent += (uint64_t)sent;
+        __sync_fetch_and_add(&h2->config->total_bytes_sent, (uint64_t)sent);
+    }
+
     return sent;
+}
+
+static ssize_t h2_recv_callback(nghttp2_session *session, uint8_t *buf, size_t length, int flags, void *user_data) {
+    H2Session *h2 = (H2Session*)user_data;
+    ssize_t received;
+
+    (void)session; (void)flags;
+
+    if (h2->ssl) {
+        received = SSL_read(h2->ssl, buf, (int)length);
+        if (received <= 0) {
+            int err = SSL_get_error(h2->ssl, (int)received);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                return NGHTTP2_ERR_WOULDBLOCK;
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    } else {
+        received = recv(h2->sockfd, buf, length, 0);
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return NGHTTP2_ERR_WOULDBLOCK;
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        if (received == 0)
+            return NGHTTP2_ERR_EOF;
+    }
+
+    return received;
 }
 
 static int h2_on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame, void *user_data) {
     H2Session *h2 = (H2Session*)user_data;
+
+    (void)session;
     
     if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
         h2->responses_received++;
@@ -107,8 +157,9 @@ static int h2_on_header_callback(nghttp2_session *session, const nghttp2_frame *
                                    const uint8_t *name, size_t namelen,
                                    const uint8_t *value, size_t valuelen,
                                    uint8_t flags, void *user_data) {
-    // Log interesting headers for debugging
-    if (namelen == 4 && memcmp(name, "HTTP", 4) == 0) {
+    (void)session; (void)frame; (void)flags; (void)user_data;
+    // Log HTTP/2 :status pseudo-header for debugging
+    if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
         fprintf(stderr, "[HTTP/2] Status: %.*s\n", (int)valuelen, value);
     }
     
@@ -120,6 +171,7 @@ static nghttp2_session_callbacks* init_h2_callbacks(void) {
     nghttp2_session_callbacks_new(&callbacks);
     
     nghttp2_session_callbacks_set_send_callback(callbacks, h2_send_callback);
+    nghttp2_session_callbacks_set_recv_callback(callbacks, h2_recv_callback);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_on_frame_recv_callback);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, h2_on_header_callback);
     
@@ -149,7 +201,44 @@ SSL_CTX* create_tls_context(bool verify_peer) {
         }
     }
     
+    // Advertise HTTP/2 via ALPN
+    static const unsigned char alpn_h2[] = "\x02h2";
+    SSL_CTX_set_alpn_protos(ctx, alpn_h2, sizeof(alpn_h2) - 1);
+
     return ctx;
+}
+
+// ============== Global Running Flag ==============
+static volatile bool g_running = true;
+
+// ============== Socket Helper ==============
+static int make_socket(const char *host, const char *port) {
+    struct addrinfo hints, *res, *rp;
+    int sockfd = -1;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        fprintf(stderr, "Failed to resolve %s:%s\n", host, port);
+        return -1;
+    }
+
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1) continue;
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sockfd);
+        sockfd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (sockfd == -1)
+        fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
+
+    return sockfd;
 }
 
 // ============== HTTP/2 Session Management ==============
@@ -260,6 +349,33 @@ void destroy_h2_session(H2Session *h2) {
     free(h2);
 }
 
+// ============== POST Body Data Provider ==============
+typedef struct {
+    const char *data;
+    size_t length;
+    size_t offset;
+} BodyDataSource;
+
+static ssize_t body_read_callback(nghttp2_session *session, int32_t stream_id,
+                                   uint8_t *buf, size_t length,
+                                   uint32_t *data_flags,
+                                   nghttp2_data_source *source,
+                                   void *user_data) {
+    BodyDataSource *ds = (BodyDataSource *)source->ptr;
+    size_t nread = ds->length - ds->offset;
+
+    (void)session; (void)stream_id; (void)user_data;
+
+    if (nread > length) nread = length;
+    memcpy(buf, ds->data + ds->offset, nread);
+    ds->offset += nread;
+    if (ds->offset == ds->length) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        free(ds);
+    }
+    return (ssize_t)nread;
+}
+
 // ============== HTTP/2 Request Submission ==============
 int submit_h2_request(H2Session *h2, const char *method, const char *path, const char *body) {
     pthread_mutex_lock(&h2->stream_lock);
@@ -319,14 +435,30 @@ int submit_h2_request(H2Session *h2, const char *method, const char *path, const
         header_idx++;
     }
     
+    // Build data provider for request body (POST/PUT)
+    nghttp2_data_provider data_prd;
+    nghttp2_data_provider *data_prd_ptr = NULL;
+    if (body && body[0] != '\0') {
+        BodyDataSource *ds = malloc(sizeof(BodyDataSource));
+        if (ds) {
+            ds->data   = body;
+            ds->length = strlen(body);
+            ds->offset = 0;
+            data_prd.source.ptr    = ds;
+            data_prd.read_callback = body_read_callback;
+            data_prd_ptr = &data_prd;
+        }
+    }
+
     // Submit request
-    int rv = nghttp2_submit_request(h2->session, NULL, headers, header_idx, 
-                                      (uint8_t*)body, body ? strlen(body) : 0, NULL);
+    int32_t rv = nghttp2_submit_request(h2->session, NULL, headers, (size_t)header_idx,
+                                        data_prd_ptr, NULL);
     
     free(headers);
     
     if (rv < 0) {
         fprintf(stderr, "Failed to submit request: %s\n", nghttp2_strerror(rv));
+        if (data_prd_ptr) free(data_prd.source.ptr);  // free ds on failure
         pthread_mutex_unlock(&h2->stream_lock);
         return -1;
     }
@@ -369,7 +501,7 @@ void* attack_thread_worker(void *arg) {
     
     time_t start_time = time(NULL);
     
-    while (1) {
+    while (g_running) {
         // Check duration limit
         if (config->duration_seconds > 0 && 
             time(NULL) - start_time >= config->duration_seconds) {
@@ -416,7 +548,7 @@ void* stats_thread(void *arg) {
     Config *config = (Config*)arg;
     time_t start = time(NULL);
     
-    while (1) {
+    while (g_running) {
         sleep(2);  // Update every 2 seconds
         
         uint64_t total = config->total_requests;
@@ -428,8 +560,8 @@ void* stats_thread(void *arg) {
         double mbps = elapsed > 0 ? (double)bytes / (elapsed * 125000) : 0;
         
         fprintf(stderr, "\r\033[K");  // Clear line
-        fprintf(stderr, "[Stats] 📊 %lu req | %.2f req/s | %.2f Mbps | %lu failed | %lu active | %ds elapsed",
-                total, req_per_sec, mbps, failed, config->active_connections, elapsed);
+        fprintf(stderr, "[Stats] 📊 %" PRIu64 " req | %.2f req/s | %.2f Mbps | %" PRIu64 " failed | %" PRIu64 " active | %lds elapsed",
+                total, req_per_sec, mbps, failed, config->active_connections, (long)elapsed);
         fflush(stderr);
         
         if (config->duration_seconds > 0 && elapsed >= config->duration_seconds) {
@@ -592,3 +724,95 @@ int parse_args(int argc, char **argv, Config *config) {
                 print_usage(argv[0]);
                 return -1;
         }
+    }
+
+    if (!config->target_host) {
+        fprintf(stderr, "Error: target host is required (-t HOST)\n");
+        print_usage(argv[0]);
+        return -1;
+    }
+    if (!config->target_port) {
+        config->target_port = strdup(config->use_tls ? "443" : "80");
+    }
+
+    return 0;
+}
+
+// ============== Signal Handler ==============
+static void signal_handler(int sig) {
+    (void)sig;
+    g_running = false;
+}
+
+// ============== Main Entry Point ==============
+int main(int argc, char **argv) {
+    Config config;
+
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (parse_args(argc, argv, &config) != 0) {
+        return 1;
+    }
+
+    printf("[*] Target:   %s:%s\n", config.target_host, config.target_port);
+    printf("[*] Threads:  %d  |  Connections/thread: %d\n",
+           config.thread_count, config.connections_per_thread);
+    printf("[*] HTTP/2: %s  |  TLS: %s\n",
+           config.enable_h2 ? "yes" : "no",
+           config.use_tls  ? "yes" : "no");
+    if (config.duration_seconds > 0)
+        printf("[*] Duration: %u seconds\n", config.duration_seconds);
+    else
+        printf("[*] Duration: unlimited (Ctrl-C to stop)\n");
+
+    signal(SIGINT,  signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    srand((unsigned)time(NULL));
+
+    // Start statistics thread
+    pthread_t stats_tid;
+    pthread_create(&stats_tid, NULL, stats_thread, &config);
+
+    // Start attack threads
+    pthread_t *attack_tids = malloc((size_t)config.thread_count * sizeof(pthread_t));
+    if (!attack_tids) {
+        fprintf(stderr, "Failed to allocate thread array\n");
+        return 1;
+    }
+    for (int i = 0; i < config.thread_count; i++) {
+        pthread_create(&attack_tids[i], NULL, attack_thread_worker, &config);
+    }
+
+    // Wait for all attack threads to finish
+    for (int i = 0; i < config.thread_count; i++) {
+        pthread_join(attack_tids[i], NULL);
+    }
+    free(attack_tids);
+
+    // Signal stats thread to stop and wait for it
+    g_running = false;
+    pthread_join(stats_tid, NULL);
+
+    // Final report
+    fprintf(stderr, "\n");
+    printf("\n[+] Done!\n");
+    printf("[+] Total requests:  %" PRIu64 "\n", config.total_requests);
+    printf("[+] Failed requests: %" PRIu64 "\n", config.failed_requests);
+    printf("[+] Bytes sent:      %" PRIu64 "\n", config.total_bytes_sent);
+
+    // Cleanup
+    free(config.target_host);
+    free(config.target_port);
+    free(config.http_method);
+    free(config.http_path);
+    free(config.http_body);
+    if (config.output_pcap_file) free(config.output_pcap_file);
+    if (config.report_file)      free(config.report_file);
+
+    return 0;
+}
